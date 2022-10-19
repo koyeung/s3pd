@@ -2,7 +2,8 @@ import mmap
 import os
 import contextlib
 from tempfile import NamedTemporaryFile
-from multiprocessing import Pool, current_process
+from multiprocessing import current_process
+import multiprocessing.pool
 from urllib.parse import urlparse
 from io import BytesIO
 
@@ -169,7 +170,7 @@ def check_link_target(bucket, key, client):
 
 def s3pd(
         url, processes=8, chunksize=67108864, destination=None, func=None,
-        signed=True, version=None):
+        signed=True, version=None, mp_context=None):
     """Main entry point to download an s3 file in parallel.
 
     Example to download a file locally:
@@ -188,6 +189,9 @@ def s3pd(
         should provide a `func` to apply on the filename and return. This is
         useful if just want to apply a function (e.g. loading) on a remote
         file.
+    :param mp_context: multiprocessing context object for starting
+        worker processes. If not provided, OS dependent default start method would
+        be used.
     """
     assert chunksize % mmap.ALLOCATIONGRANULARITY == 0
 
@@ -219,7 +223,9 @@ def s3pd(
             for task in download_tasks:
                 download_chunk(*task)
         else:
-            with Pool(processes=processes) as pool:
+            with multiprocessing.pool.Pool(
+                    processes=processes, context=mp_context
+            ) as pool:
                 pool.starmap(download_chunk, download_tasks)
 
         if func:
