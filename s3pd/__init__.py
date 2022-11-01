@@ -2,7 +2,8 @@ import mmap
 import os
 import contextlib
 from tempfile import NamedTemporaryFile
-from multiprocessing import Pool, current_process
+from multiprocessing import current_process
+import multiprocessing.pool
 from urllib.parse import urlparse
 from io import BytesIO
 
@@ -13,39 +14,25 @@ import boto3
 LINK_SENTINEL = '#S3LINK#'
 
 @contextlib.contextmanager
-def shm_file(size, destination):
-    """Create a named shared memory and return its file object.
+def prepare_shared_file(size, destination):
+    """Return path of shared file.
 
     :param size: Size of the file to create, in bytes.
     :param destination: Path of the file to create, or `None` to create a
-        temporary file in /dev/shm.
-    :return: A tuple `(file object, path)` to be used from a context manager.
+        temporary file in /dev/shm (available on linux only).
+    :return: path to be used from a context manager.
     """
     if destination:
-        with open(destination, 'w+b') as shmfile:
+        with open(destination, mode='w+b') as shmfile:
             os.truncate(shmfile.fileno(), size)
             shmfile.seek(0)
-            yield shmfile, destination
+            yield destination
     else:
         with NamedTemporaryFile(mode='wb', prefix='s3-', dir='/dev/shm') as shmfile:
             os.truncate(shmfile.fileno(), size)
             shmfile.seek(0)
-            yield shmfile, shmfile.name
+            yield shmfile.name
 
-@contextlib.contextmanager
-def shm_map(fileno, offset, size):
-    """Create a memory map of a file or shared memory and return it.
-
-    :param fileno: File descriptor of the file on which to create the memory
-        map.
-    :param offset: Offset in the file to map, in bytes.
-    :param size: Size of the mapping, in bytes.
-    :return: The memory map object.
-    """
-    assert offset % mmap.ALLOCATIONGRANULARITY == 0
-    shm = mmap.mmap(fileno=fileno, length=size, offset=offset)
-    yield shm
-    shm.close()
 
 def get_filesize(client, bucket, key, version=None):
     """Return the size of file on S3.
@@ -96,12 +83,12 @@ def create_client(signed=True):
             config=botocore.config.Config(signature_version=botocore.UNSIGNED))
 
 def download_chunk(
-        bucket, key, shmfileno, offset_first, offset_last, signed, version=None):
+        bucket, key, shared_filepath, offset_first, offset_last, signed, version=None):
     """Worker function to download a chunk of the file.
 
     :param bucket: Name of the S3 bucket.
     :param key: Path inside the bucket (without leading `/`)
-    :param shmfileno: File descriptor for an opened destination file.
+    :param shared_filepath: path to shared file.
     :param offset_first: Start position of the chunk to download.
     :param offset_last: Last position of the chunk to download.
     :param version: The file version to retrieve, or None
@@ -114,7 +101,16 @@ def download_chunk(
         'Range': 'bytes=%s-%s' % (offset_first, offset_last),
         **({'VersionId': version} if version else {}),
     }
-    with shm_map(shmfileno, offset_first, offset_last - offset_first + 1) as shmmap:
+
+    offset = offset_first
+    assert offset % mmap.ALLOCATIONGRANULARITY == 0
+    length = offset_last - offset_first + 1
+
+    with open(shared_filepath, mode='a+b') as file_, mmap.mmap(
+            fileno=file_.fileno(),
+            length=length,
+            offset=offset,
+    ) as shmmap:
         chunk = client.get_object(**args)['Body']
         chunk._raw_stream.readinto(shmmap)
 
@@ -174,7 +170,7 @@ def check_link_target(bucket, key, client):
 
 def s3pd(
         url, processes=8, chunksize=67108864, destination=None, func=None,
-        signed=True, version=None):
+        signed=True, version=None, mp_context=None):
     """Main entry point to download an s3 file in parallel.
 
     Example to download a file locally:
@@ -193,6 +189,9 @@ def s3pd(
         should provide a `func` to apply on the filename and return. This is
         useful if just want to apply a function (e.g. loading) on a remote
         file.
+    :param mp_context: multiprocessing context object for starting
+        worker processes. If not provided, OS dependent default start method would
+        be used.
     """
     assert chunksize % mmap.ALLOCATIONGRANULARITY == 0
 
@@ -213,17 +212,21 @@ def s3pd(
     if current_process().daemon:
         processes = 1
 
-    with shm_file(filesize, destination) as (shmfile, shmfilename):
+    with prepare_shared_file(filesize, destination) as shared_filepath:
         download_tasks = [
-            (bucket, key, shmfile.fileno(), *chunk, signed, version)
+            # pass path to shared file instead of file descriptor
+            # for use with multiprocessing context start method other than fork
+            (bucket, key, shared_filepath, *chunk, signed, version)
             for chunk in chunks]
 
         if processes == 1:
             for task in download_tasks:
                 download_chunk(*task)
         else:
-            with Pool(processes=processes) as pool:
+            with multiprocessing.pool.Pool(
+                    processes=processes, context=mp_context
+            ) as pool:
                 pool.starmap(download_chunk, download_tasks)
 
         if func:
-            return func(shmfilename)
+            return func(shared_filepath)
